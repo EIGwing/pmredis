@@ -1,0 +1,6 @@
+requests>=2.31.0
+websocket-client>=1.7.0
+websockets>=10.0
+web3>=6.0
+playwright>=1.40
+redis>=5.0.0
