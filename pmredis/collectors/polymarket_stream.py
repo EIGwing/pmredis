@@ -56,12 +56,14 @@ class PolymarketStreamScraper:
         self._fallback_price_to_beat: Optional[float] = (
             None  # Fallback using last current_price during transition
         )
+        self._fallback_price_time: float = 0  # Timestamp when fallback was captured
         self._waiting_for_ptb = (
             False  # True when transitioning, waiting for official price_to_beat
         )
         self._last_current_price: Optional[float] = (
             None  # Last current_price for fallback
         )
+        self._last_current_price_time: float = 0  # Timestamp of last current_price
         self._last_hover_time = 0
         self._hover_x_percent = 0.885
         self._last_data_time = 0
@@ -353,11 +355,20 @@ class PolymarketStreamScraper:
             logger.info(f"Market transition: {self._current_epoch} -> {current_epoch}")
 
             # Set fallback price_to_beat using last current_price (until official one is retrieved)
-            if self._last_current_price is not None:
+            # Only use if we have recent data (within last 10 seconds)
+            if (
+                self._last_current_price is not None
+                and time.time() - self._last_current_price_time < 10
+            ):
                 self._fallback_price_to_beat = self._last_current_price
+                self._fallback_price_time = self._last_current_price_time
                 self._waiting_for_ptb = True
                 logger.info(
-                    f"Using fallback price_to_beat: {self._fallback_price_to_beat}"
+                    f"Using fallback price_to_beat: {self._fallback_price_to_beat} (captured at {self._fallback_price_time})"
+                )
+            else:
+                logger.warning(
+                    f"No recent price data for fallback (last update: {self._last_current_price_time})"
                 )
 
             # Use temp page to get new price_to_beat
@@ -477,6 +488,7 @@ class PolymarketStreamScraper:
                         # Save last current_price for fallback during transition
                         if price is not None:
                             self._last_current_price = price
+                            self._last_current_price_time = time.time()
                             # Use fallback if waiting for official price_to_beat
                             if (
                                 self._waiting_for_ptb
