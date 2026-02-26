@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import time
+import threading
 from datetime import datetime
+from typing import Optional
 
 from playwright.async_api import async_playwright
 
@@ -44,9 +46,11 @@ SELECTORS = {
 class PolymarketStreamScraper:
     def __init__(self, check_interval_ms: int = 250):
         self._browser = None
-        self._page = None
+        self._page = None  # Main page for tooltip (current_price, chart_timestamp)
+        self._ptb_page = None  # Temp page for price_to_beat on session switch
         self._playwright = None
         self._current_epoch = None
+        self._current_price_to_beat: Optional[float] = None  # Latest price_to_beat
         self._last_hover_time = 0
         self._hover_x_percent = 0.885
         self._last_data_time = 0
@@ -54,6 +58,10 @@ class PolymarketStreamScraper:
         self._consecutive_no_data = 0
         self._check_interval_ms = check_interval_ms
         self._callbacks = []
+        self._is_recovering = False  # Flag to prevent duplicate recovery
+        self._reload_event = (
+            threading.Event()
+        )  # Event to signal reload from main thread
 
     def add_callback(self, callback):
         """Add a callback for price updates."""
@@ -294,13 +302,63 @@ class PolymarketStreamScraper:
             setInterval(checkChanges, {self._check_interval_ms});
         }}""")
 
+    async def _get_price_to_beat_from_page(self, page, epoch: int) -> Optional[float]:
+        """Get price_to_beat from a specific page (static DOM, no hover needed)."""
+        url = get_url(epoch)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
+
+            # Try multiple selectors for price_to_beat
+            for selector in SELECTORS["price_to_beat"]:
+                try:
+                    ptb_elem = await page.query_selector(selector)
+                    if ptb_elem:
+                        ptb_text = await ptb_elem.inner_text()
+                        if ptb_text:
+                            ptb_value = float(
+                                ptb_text.replace("$", "").replace(",", "")
+                            )
+                            logger.info(
+                                f"Got price_to_beat from epoch {epoch}: {ptb_value}"
+                            )
+                            return ptb_value
+                except Exception:
+                    continue
+
+            logger.warning(f"Could not find price_to_beat selector for epoch {epoch}")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting price_to_beat: {e}")
+            return None
+
     async def _check_market_transition(self):
-        """Check if we need to switch to a new market."""
+        """Check if we need to get new price_to_beat for new market.
+
+        Uses temp page to get price_to_beat without disrupting main tooltip page.
+        """
         current_epoch = get_current_epoch()
         if current_epoch != self._current_epoch:
-            logger.debug(f"Market transition: {self._current_epoch} -> {current_epoch}")
-            self._current_epoch = current_epoch
-            await self._navigate_to_current_market()
+            logger.info(f"Market transition: {self._current_epoch} -> {current_epoch}")
+
+            # Use temp page to get new price_to_beat
+            if self._ptb_page is None:
+                self._ptb_page = await self._browser.new_page(
+                    viewport={"width": 1280, "height": 720},
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                )
+
+            # Get price_to_beat from new session
+            new_ptb = await self._get_price_to_beat_from_page(
+                self._ptb_page, current_epoch
+            )
+            if new_ptb is not None:
+                self._current_price_to_beat = new_ptb
+                self._current_epoch = current_epoch
+                logger.info(
+                    f"Updated price_to_beat to {new_ptb} for epoch {current_epoch}"
+                )
+
             return True
         return False
 
@@ -361,12 +419,22 @@ class PolymarketStreamScraper:
         await self._init_browser()
         await self._navigate_to_current_market()
 
+        # Get initial price_to_beat from current session
+        self._current_price_to_beat = await self._get_price_to_beat_from_page(
+            self._page, self._current_epoch
+        )
+
         start_time = asyncio.get_event_loop().time()
 
         logger.info(f"Monitoring Polymarket BTC 5min markets... (Ctrl+C to stop)")
 
         try:
             while True:
+                # Check if reload is requested from main thread
+                if self._reload_event.is_set():
+                    self._reload_event.clear()
+                    await self.reload()
+
                 await self._check_market_transition()
                 await self._maybe_rehover()
                 await self._check_stall_and_recover()
@@ -376,25 +444,20 @@ class PolymarketStreamScraper:
                 if changed:
                     data = await self._page.evaluate("() => window.currentData")
 
-                    if data and data.get("currentPrice") and data.get("priceToBeat"):
+                    if data and data.get("currentPrice"):
                         price_str = data.get("currentPrice", "")
-                        ptb_str = data.get("priceToBeat", "")
+                        chart_ts = data.get("timestamp", "")
 
-                        # Parse price strings like "$63,188.58" to float
+                        # Parse price string like "$63,188.58" to float
                         try:
                             price = float(price_str.replace("$", "").replace(",", ""))
                         except (ValueError, AttributeError):
                             price = None
-                        try:
-                            price_to_beat = float(
-                                ptb_str.replace("$", "").replace(",", "")
-                            )
-                        except (ValueError, AttributeError):
-                            price_to_beat = None
 
-                        chart_ts = data.get("timestamp", "")
+                        # Get price_to_beat from instance variable (set during session switch)
+                        price_to_beat = self._current_price_to_beat
 
-                        # Notify callbacks
+                        # Notify callbacks with price from tooltip and price_to_beat from transition
                         if price is not None:
                             self._notify_callbacks(price, price_to_beat, chart_ts)
 
@@ -415,10 +478,44 @@ class PolymarketStreamScraper:
             await self.close()
 
     async def close(self):
+        if self._ptb_page:
+            await self._ptb_page.close()
+            self._ptb_page = None
         if self._browser:
             await self._browser.close()
         if self._playwright:
             await self._playwright.stop()
+
+    def is_recovering(self) -> bool:
+        """Check if recovery is in progress."""
+        return self._is_recovering
+
+    def trigger_reload(self):
+        """Trigger reload from external thread (main.py)."""
+        logger.info("External reload requested")
+        self._reload_event.set()
+
+    async def reload(self):
+        """Force reload of the main tooltip page (for recovery)."""
+        if self._is_recovering:
+            logger.debug("Recovery already in progress, skipping")
+            return
+
+        self._is_recovering = True
+        logger.info("Triggering recovery: re-navigating tooltip page to current market")
+
+        try:
+            # Re-navigate the main page to current market
+            await self._navigate_to_current_market()
+
+            # Also refresh price_to_beat
+            self._current_price_to_beat = await self._get_price_to_beat_from_page(
+                self._page, self._current_epoch
+            )
+
+            logger.info("Recovery complete")
+        finally:
+            self._is_recovering = False
 
 
 async def run_polymarket_stream(duration: int = None):

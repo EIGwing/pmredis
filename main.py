@@ -152,9 +152,16 @@ class DataCollectorRedis:
 
         # Polymarket stream state
         self._pm_stream_thread: Optional[threading.Thread] = None
+        self._pm_stream_scraper = None  # Reference to scraper for recovery
         self._pm_stream_price: Optional[float] = None
         self._pm_stream_price_to_beat: Optional[float] = None
         self._pm_stream_timestamp: Optional[str] = None
+        self._pm_stream_last_chart_timestamp: Optional[int] = (
+            None  # Last chart timestamp in ms
+        )
+        self._pm_stream_last_price: Optional[float] = None  # Last price value
+        self._pm_stream_no_change_threshold: float = 30.0  # seconds
+        self._pm_stream_recovery_in_progress = False
 
         # Session tracking
         self._current_session_epoch: int = 0
@@ -229,17 +236,32 @@ class DataCollectorRedis:
 
             def on_price_update(price, price_to_beat, timestamp):
                 """Callback for price updates from polymarket_stream."""
+                # Parse chart timestamp to epoch ms for staleness detection
+                chart_ts_utc = 0
+                if timestamp:
+                    current_epoch = int(time.time()) - (int(time.time()) % 300)
+                    chart_ts_utc = self._parse_chart_timestamp(timestamp, current_epoch)
+
                 with self._pm_ws_lock:
                     self._pm_stream_price = price
                     self._pm_stream_price_to_beat = price_to_beat
                     self._pm_stream_timestamp = timestamp
                     self._pm_stream_last_update = time.time()
+                    # Store for staleness detection
+                    if chart_ts_utc:
+                        self._pm_stream_last_chart_timestamp = chart_ts_utc
+                    if price:
+                        self._pm_stream_last_price = price
                 logger.log(TRACE, f"Price update: {price} | ptb: {price_to_beat}")
 
             def run_scraper():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 scraper = PolymarketStreamScraper(check_interval_ms=250)
+
+                # Store scraper reference for recovery trigger
+                self._pm_stream_scraper = scraper
+
                 scraper.add_callback(on_price_update)
 
                 async def monitor():
@@ -1014,6 +1036,8 @@ class DataCollectorRedis:
 
     def _sample_polymarket_stream(self, ts, ts_ms: int, session_epoch: int):
         """Sample Polymarket stream data (from async scraper)."""
+        current_time = time.time()
+
         with self._pm_ws_lock:
             price = self._pm_stream_price
             price_to_beat = self._pm_stream_price_to_beat
@@ -1023,6 +1047,31 @@ class DataCollectorRedis:
             chart_ts_utc = 0
             if timestamp:
                 chart_ts_utc = self._parse_chart_timestamp(timestamp, session_epoch)
+
+            # Staleness detection: check if chart_timestamp AND price not advancing
+            if (
+                self._pm_stream_last_chart_timestamp
+                and self._pm_stream_last_price
+                and chart_ts_utc == self._pm_stream_last_chart_timestamp
+                and price == self._pm_stream_last_price
+            ):
+                time_since_no_change = current_time - self._pm_stream_last_update
+                if time_since_no_change > self._pm_stream_no_change_threshold:
+                    if not self._pm_stream_recovery_in_progress:
+                        logger.warning(
+                            f"No price/chart change for {time_since_no_change:.1f}s, triggering recovery"
+                        )
+                        self._pm_stream_recovery_in_progress = True
+                        # Trigger reload in scraper thread
+                        if self._pm_stream_scraper:
+                            self._pm_stream_scraper.trigger_reload()
+
+                        # Reset recovery flag after a delay (actual reset happens in scraper)
+                        def reset_recovery():
+                            time.sleep(5)
+                            self._pm_stream_recovery_in_progress = False
+
+                        threading.Thread(target=reset_recovery, daemon=True).start()
 
             record = {
                 "timestamp": str(ts_ms),
