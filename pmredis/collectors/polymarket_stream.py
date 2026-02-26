@@ -50,7 +50,18 @@ class PolymarketStreamScraper:
         self._ptb_page = None  # Temp page for price_to_beat on session switch
         self._playwright = None
         self._current_epoch = None
-        self._current_price_to_beat: Optional[float] = None  # Latest price_to_beat
+        self._current_price_to_beat: Optional[float] = (
+            None  # Latest price_to_beat (official)
+        )
+        self._fallback_price_to_beat: Optional[float] = (
+            None  # Fallback using last current_price during transition
+        )
+        self._waiting_for_ptb = (
+            False  # True when transitioning, waiting for official price_to_beat
+        )
+        self._last_current_price: Optional[float] = (
+            None  # Last current_price for fallback
+        )
         self._last_hover_time = 0
         self._hover_x_percent = 0.885
         self._last_data_time = 0
@@ -341,6 +352,14 @@ class PolymarketStreamScraper:
         if current_epoch != self._current_epoch:
             logger.info(f"Market transition: {self._current_epoch} -> {current_epoch}")
 
+            # Set fallback price_to_beat using last current_price (until official one is retrieved)
+            if self._last_current_price is not None:
+                self._fallback_price_to_beat = self._last_current_price
+                self._waiting_for_ptb = True
+                logger.info(
+                    f"Using fallback price_to_beat: {self._fallback_price_to_beat}"
+                )
+
             # Use temp page to get new price_to_beat
             if self._ptb_page is None:
                 self._ptb_page = await self._browser.new_page(
@@ -355,6 +374,7 @@ class PolymarketStreamScraper:
             if new_ptb is not None:
                 self._current_price_to_beat = new_ptb
                 self._current_epoch = current_epoch
+                self._waiting_for_ptb = False  # Official price_to_beat received
                 logger.info(
                     f"Updated price_to_beat to {new_ptb} for epoch {current_epoch}"
                 )
@@ -454,8 +474,17 @@ class PolymarketStreamScraper:
                         except (ValueError, AttributeError):
                             price = None
 
-                        # Get price_to_beat from instance variable (set during session switch)
-                        price_to_beat = self._current_price_to_beat
+                        # Save last current_price for fallback during transition
+                        if price is not None:
+                            self._last_current_price = price
+                            # Use fallback if waiting for official price_to_beat
+                            if (
+                                self._waiting_for_ptb
+                                and self._fallback_price_to_beat is not None
+                            ):
+                                price_to_beat = self._fallback_price_to_beat
+                            else:
+                                price_to_beat = self._current_price_to_beat
 
                         # Notify callbacks with price from tooltip and price_to_beat from transition
                         if price is not None:
