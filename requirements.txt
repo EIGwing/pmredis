@@ -4,3 +4,5 @@ websockets>=10.0
 web3>=6.0
 playwright>=1.40
 redis>=5.0.0
+pandas>=1.5.0
+pyarrow>=14.0.0

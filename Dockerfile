@@ -10,6 +10,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install Playwright browsers
 RUN python -m playwright install chromium
 
+# Install Playwright system dependencies
+RUN python -m playwright install-deps chromium
+
 COPY . .
 
 CMD ["python", "main.py", "start"]

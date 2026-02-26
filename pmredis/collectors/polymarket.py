@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import websocket
 
+TRACE = 5
+logging.addLevelName(TRACE, "TRACE")
+
 from .base import BaseCollector
 
 logger = logging.getLogger(__name__)
@@ -403,3 +406,340 @@ class PolymarketCollector(BaseCollector):
             logger.info(
                 f"Exported {len(orderbook_df)} orderbook snapshots to orderbook.csv"
             )
+
+
+class PolymarketRTDS:
+    """Real-Time Data Socket client for Polymarket prices.
+
+    WebSocket endpoint: wss://ws-live-data.polymarket.com
+    """
+
+    def __init__(self):
+        self.ws: Optional[websocket.WebSocketApp] = None
+        self._running = False
+        self._thread = None
+        self._lock = __import__("threading").Lock()
+
+        # Price data - keyed by asset (e.g., "BTC-USD", "ETH-USD")
+        self._prices: Dict[str, Dict[str, Any]] = {}
+
+        # Callbacks for price updates
+        self._callbacks: List[callable] = []
+
+    def start(self) -> bool:
+        """Start the RTDS WebSocket connection."""
+        if self._running:
+            return True
+
+        self._running = True
+        self._thread = __import__("threading").Thread(target=self._run, daemon=True)
+        self._thread.start()
+        logger.info("Polymarket RTDS WebSocket started")
+        return True
+
+    def stop(self):
+        """Stop the WebSocket connection."""
+        self._running = False
+        if self.ws:
+            self.ws.close()
+        logger.info("Polymarket RTDS WebSocket stopped")
+
+    def _run(self):
+        """Run the WebSocket connection with auto-reconnect."""
+        while self._running:
+            try:
+                self.ws = websocket.WebSocketApp(
+                    "wss://ws-live-data.polymarket.com",
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                    on_open=self._on_open,
+                )
+                self.ws.run_forever(ping_interval=5)
+            except Exception as e:
+                logger.error(f"RTDS WebSocket error: {e}")
+
+            if self._running:
+                logger.info("RTDS WebSocket reconnecting in 5 seconds...")
+                time.sleep(5)
+
+    def _on_open(self, ws):
+        """Subscribe to crypto prices."""
+        ws.send(
+            json.dumps(
+                {
+                    "action": "subscribe",
+                    "subscriptions": [{"topic": "crypto_prices", "type": "update"}],
+                }
+            )
+        )
+        logger.debug("RTDS subscribed to crypto_prices")
+
+    def _on_message(self, ws, message):
+        """Handle incoming messages."""
+        try:
+            data = json.loads(message)
+            if not isinstance(data, dict):
+                return
+
+            topic = data.get("topic")
+            payload = data.get("payload", {})
+
+            if topic == "crypto_prices" and isinstance(payload, dict):
+                for asset, price_data in payload.items():
+                    if isinstance(price_data, dict):
+                        with self._lock:
+                            self._prices[asset] = {
+                                "price": price_data.get("price"),
+                                "timestamp": price_data.get("timestamp"),
+                                "source": price_data.get("source"),
+                            }
+
+                        for callback in self._callbacks:
+                            try:
+                                callback(asset, self._prices[asset])
+                            except Exception as e:
+                                logger.debug(f"Callback error: {e}")
+
+        except json.JSONDecodeError:
+            pass
+        except Exception as e:
+            logger.debug(f"RTDS message parse error: {e}")
+
+    def _on_error(self, ws, error):
+        logger.error(f"RTDS WebSocket error: {error}")
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        logger.debug(f"RTDS WebSocket closed: {close_status_code} - {close_msg}")
+
+    def get_price(self, asset: str = "BTC-USD") -> Optional[float]:
+        """Get current price for an asset."""
+        with self._lock:
+            price_data = self._prices.get(asset)
+            if price_data:
+                return price_data.get("price")
+
+    def get_all_prices(self) -> Dict[str, Dict[str, Any]]:
+        """Get all cached prices."""
+        with self._lock:
+            return dict(self._prices)
+
+    def add_callback(self, callback: callable):
+        """Add a callback for price updates."""
+        self._callbacks.append(callback)
+
+
+class PolymarketCLOB:
+    """CLOB WebSocket client for Polymarket orderbook.
+
+    WebSocket endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
+    """
+
+    def __init__(self):
+        self.ws: Optional[websocket.WebSocketApp] = None
+        self._running = False
+        self._thread = None
+        self._lock = __import__("threading").Lock()
+
+        # Orderbook data - keyed by token_id
+        self._orderbooks: Dict[str, Dict[str, Any]] = {}
+
+        # Subscribed tokens
+        self._subscribed_tokens: set = set()
+
+        # Last update timestamp for staleness detection
+        self._last_update_time: float = 0
+
+    def start(self) -> bool:
+        """Start the CLOB WebSocket connection."""
+        if self._running:
+            return True
+
+        self._running = True
+        self._thread = __import__("threading").Thread(target=self._run, daemon=True)
+        self._thread.start()
+        logger.info("Polymarket CLOB WebSocket started")
+        return True
+
+    def stop(self):
+        """Stop the WebSocket connection."""
+        self._running = False
+        if self.ws:
+            self.ws.close()
+        logger.info("Polymarket CLOB WebSocket stopped")
+
+    def subscribe(self, token_ids: List[str]):
+        """Subscribe to orderbook updates for token IDs."""
+        with self._lock:
+            new_tokens = set(token_ids) - self._subscribed_tokens
+            self._subscribed_tokens.update(new_tokens)
+
+            logger.info(
+                f"CLOB subscribe: adding {len(new_tokens)} tokens, total: {len(self._subscribed_tokens)}"
+            )
+
+            if new_tokens and self._running and self.ws:
+                logger.info(
+                    f"CLOB subscribing to {len(new_tokens)} new tokens, reconnecting..."
+                )
+                self.ws.close()
+
+    def unsubscribe(self, token_ids: List[str]):
+        """Unsubscribe from orderbook updates for token IDs."""
+        with self._lock:
+            removed_tokens = set(token_ids) & self._subscribed_tokens
+            self._subscribed_tokens -= removed_tokens
+
+            # Also clean up orderbook data for unsubscribed tokens
+            for token_id in removed_tokens:
+                if token_id in self._orderbooks:
+                    del self._orderbooks[token_id]
+
+            logger.info(
+                f"CLOB unsubscribe: removing {len(removed_tokens)} tokens, total: {len(self._subscribed_tokens)}"
+            )
+
+            if removed_tokens and self._running and self.ws:
+                logger.info(
+                    f"CLOB unsubscribing from {len(removed_tokens)} tokens, reconnecting..."
+                )
+                self.ws.close()
+
+    def _run(self):
+        """Run the WebSocket connection with auto-reconnect."""
+        while self._running:
+            try:
+                self.ws = websocket.WebSocketApp(
+                    "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                    on_open=self._on_open,
+                )
+                self.ws.run_forever(ping_interval=5)
+
+            except Exception as e:
+                logger.error(f"CLOB WebSocket error: {e}")
+
+            if self._running:
+                logger.info("CLOB WebSocket reconnecting in 5 seconds...")
+                time.sleep(5)
+
+    def _on_open(self, ws):
+        """Subscribe to orderbooks."""
+        token_ids = list(self._subscribed_tokens)
+        logger.info(
+            f"CLOB WebSocket opened, subscribing to {len(token_ids)} tokens: {token_ids}"
+        )
+
+        msg = json.dumps(
+            {
+                "assets_ids": token_ids,
+                "type": "market",
+                "custom_feature_enabled": True,
+            }
+        )
+        ws.send(msg)
+        logger.debug(f"CLOB sent subscription message")
+
+    def _on_message(self, ws, message):
+        """Handle incoming messages."""
+        try:
+            data = json.loads(message)
+            if not isinstance(data, dict):
+                logger.debug(f"CLOB received non-dict message: {type(data)}")
+                return
+
+            event_type = data.get("event_type")
+
+            if event_type == "book":
+                asset_id = data.get("asset_id")
+                if asset_id:
+                    with self._lock:
+                        self._orderbooks[asset_id] = {
+                            "bids": data.get("bids", []),
+                            "asks": data.get("asks", []),
+                            "timestamp": data.get("timestamp", int(time.time() * 1000)),
+                        }
+                        self._last_update_time = time.time()
+                    logger.log(TRACE, f"CLOB received orderbook for {asset_id[:20]}...")
+
+            elif event_type == "price_change":
+                asset_id = data.get("asset_id")
+                price = data.get("price")
+                if asset_id:
+                    with self._lock:
+                        if asset_id in self._orderbooks:
+                            self._orderbooks[asset_id]["last_price"] = price
+                            self._last_update_time = time.time()
+
+            elif event_type == "best_bid_ask":
+                asset_id = data.get("asset_id")
+                best_bid = data.get("best_bid")
+                best_ask = data.get("best_ask")
+                if asset_id:
+                    with self._lock:
+                        if asset_id in self._orderbooks:
+                            self._orderbooks[asset_id]["best_bid"] = best_bid
+                            self._orderbooks[asset_id]["best_ask"] = best_ask
+                            self._last_update_time = time.time()
+                    logger.log(
+                        TRACE,
+                        f"CLOB best_bid_ask for {asset_id[:20]}...: {best_bid}/{best_ask}",
+                    )
+
+            elif event_type == "last_trade_price":
+                asset_id = data.get("asset_id")
+                price = data.get("price")
+                if asset_id:
+                    with self._lock:
+                        if asset_id in self._orderbooks:
+                            self._orderbooks[asset_id]["last_price"] = price
+
+            elif event_type == "new_market":
+                question = data.get("question", "")
+                slug = data.get("slug", "")
+                assets_ids = data.get("assets_ids", [])
+                timestamp = data.get("timestamp", "")
+                logger.debug(
+                    f"CLOB new_market: {question} | slug: {slug} | tokens: {assets_ids} | ts: {timestamp}"
+                )
+
+            elif data.get("type") == "market":
+                logger.debug(f"CLOB market subscription confirmed")
+
+            else:
+                logger.debug(
+                    f"CLOB unknown event_type: {event_type}, keys: {list(data.keys())}"
+                )
+
+        except json.JSONDecodeError:
+            logger.debug(f"CLOB received non-JSON message: {message[:200]}")
+        except Exception as e:
+            logger.debug(f"CLOB message parse error: {e}")
+
+    def _on_error(self, ws, error):
+        logger.error(f"CLOB WebSocket error: {error}")
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        logger.debug(f"CLOB WebSocket closed: {close_status_code} - {close_msg}")
+
+    def get_orderbook(self, token_id: str) -> Optional[Dict[str, Any]]:
+        """Get current orderbook for a token."""
+        with self._lock:
+            return self._orderbooks.get(token_id)
+
+    def get_all_orderbooks(self) -> Dict[str, Dict[str, Any]]:
+        """Get all cached orderbooks."""
+        with self._lock:
+            return dict(self._orderbooks)
+
+    def get_subscription_count(self) -> int:
+        """Get number of active subscriptions."""
+        with self._lock:
+            return len(self._subscribed_tokens)
+
+    def get_last_update_time(self) -> float:
+        """Get timestamp of last orderbook update."""
+        with self._lock:
+            return self._last_update_time

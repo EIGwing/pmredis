@@ -1,11 +1,11 @@
-version: '3.8'
-
 services:
   redis:
-    image: redis:latest
+    image: redis/redis-stack:latest
     ports:
       - "6379:6379"
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+      - "8001:8001"
+    environment:
+      - REDISINSIGHT_BIND=0.0.0.0
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -14,6 +14,7 @@ services:
 
   pmredis:
     build: .
+    restart: on-failure
     depends_on:
       redis:
         condition: service_healthy
@@ -22,3 +23,4 @@ services:
       - REDIS_PORT=6379
     volumes:
       - ./data:/app/data
+    command: python main.py start --log-level INFO

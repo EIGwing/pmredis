@@ -10,7 +10,7 @@ import redis
 logger = logging.getLogger(__name__)
 
 DEFAULT_STREAM_KEY = "data:{table_name}"
-TEN_MINUTES_MS = 10 * 60 * 1000  # 10 minutes in milliseconds
+TEN_MINUTES_MS = 15 * 60 * 1000  # 15 minutes in milliseconds (for export buffer)
 
 
 class RedisManager:
@@ -23,6 +23,7 @@ class RedisManager:
         db: int = 0,
         max_memory_mb: int = 256,
         rolling_window_ms: int = TEN_MINUTES_MS,
+        dry_run: bool = False,
     ):
         self.host = host
         self.port = port
@@ -30,9 +31,16 @@ class RedisManager:
         self.rolling_window_ms = rolling_window_ms
         self._client: Optional[redis.Redis] = None
         self._max_memory_mb = max_memory_mb
+        self.dry_run = dry_run
 
     def connect(self) -> bool:
         """Connect to Redis server."""
+        if self.dry_run:
+            logger.info(
+                f"[DRY-RUN] Skipping Redis connection to {self.host}:{self.port}"
+            )
+            return True
+
         try:
             self._client = redis.Redis(
                 host=self.host,
@@ -61,6 +69,9 @@ class RedisManager:
 
     def is_connected(self) -> bool:
         """Check if Redis is connected."""
+        if self.dry_run:
+            return True
+
         if self._client is None:
             return False
         try:
@@ -83,6 +94,11 @@ class RedisManager:
         Returns:
             Message ID if successful, None otherwise
         """
+        if self.dry_run:
+            fields = " | ".join(f"{k}: {v}" for k, v in data.items())
+            logger.info(f"[DRY-RUN] {stream_key} | {fields}")
+            return "dry-run-msg-id"
+
         if not self.is_connected():
             if not self.reconnect():
                 return None
@@ -104,6 +120,9 @@ class RedisManager:
         Returns:
             Number of entries removed, or -1 on error
         """
+        if self.dry_run:
+            return 0
+
         if not self.is_connected():
             return -1
 
@@ -122,8 +141,37 @@ class RedisManager:
             logger.error(f"Failed to trim stream {stream_key}: {e}")
             return -1
 
+    def trim_older_than(self, stream_key: str, window_seconds: int = 900) -> int:
+        """Trim entries older than window_seconds using time-based MINID.
+
+        Args:
+            stream_key: Redis stream key
+            window_seconds: Keep entries newer than this (default: 900s = 15min)
+
+        Returns:
+            Number of entries removed, or -1 on error
+        """
+        if self.dry_run:
+            return 0
+
+        if not self.is_connected():
+            return -1
+
+        cutoff_ms = (time.time() - window_seconds) * 1000
+        cutoff_id = f"{int(cutoff_ms)}-0"
+
+        try:
+            removed = self._client.xtrim(stream_key, minid=cutoff_id, limit=100)
+            return removed
+        except redis.RedisError as e:
+            logger.error(f"Failed to trim stream {stream_key}: {e}")
+            return -1
+
     def xlen(self, stream_key: str) -> int:
         """Get the number of entries in a stream."""
+        if self.dry_run:
+            return 0
+
         if not self.is_connected():
             return 0
         try:
@@ -144,6 +192,9 @@ class RedisManager:
         Returns:
             List of entries as dictionaries
         """
+        if self.dry_run:
+            return []
+
         if not self.is_connected():
             return []
 
@@ -177,11 +228,14 @@ class RedisManager:
         Returns:
             List of entries as dictionaries
         """
+        if self.dry_run:
+            return []
+
         if not self.is_connected():
             return []
 
         try:
-            result = self._client.xrange(stream_key, start=start, end=end, count=count)
+            result = self._client.xrange(stream_key, start, end, count)
             entries = []
             for msg_id, fields in result:
                 entry = {"_id": msg_id}
@@ -210,6 +264,10 @@ class RedisManager:
 
     def close(self) -> None:
         """Close Redis connection."""
+        if self.dry_run:
+            logger.info("[DRY-RUN] Skipping Redis close")
+            return
+
         if self._client:
             try:
                 self._client.close()

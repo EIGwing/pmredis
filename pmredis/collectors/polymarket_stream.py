@@ -5,6 +5,9 @@ from datetime import datetime
 
 from playwright.async_api import async_playwright
 
+TRACE = 5
+logging.addLevelName(TRACE, "TRACE")
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,7 +42,7 @@ SELECTORS = {
 
 
 class PolymarketStreamScraper:
-    def __init__(self, check_interval_ms: int = 500):
+    def __init__(self, check_interval_ms: int = 250):
         self._browser = None
         self._page = None
         self._playwright = None
@@ -50,6 +53,19 @@ class PolymarketStreamScraper:
         self._stall_recovery_attempts = 0
         self._consecutive_no_data = 0
         self._check_interval_ms = check_interval_ms
+        self._callbacks = []
+
+    def add_callback(self, callback):
+        """Add a callback for price updates."""
+        self._callbacks.append(callback)
+
+    def _notify_callbacks(self, price, price_to_beat, timestamp):
+        """Notify all callbacks with new price data."""
+        for callback in self._callbacks:
+            try:
+                callback(price, price_to_beat, timestamp)
+            except Exception as e:
+                logger.debug(f"Callback error: {e}")
 
     async def _init_browser(self):
         if self._playwright is None:
@@ -117,7 +133,7 @@ class PolymarketStreamScraper:
             await self._page.mouse.move(x, y)
             await self._page.wait_for_timeout(500)
             self._last_hover_time = time.time()
-            logger.debug(f"Hovered at {label}: ({x}, {y})")
+            logger.log(TRACE, f"Hovered at {label}: ({x}, {y})")
             return True
         except Exception as e:
             logger.warning(f"Hover at {label} failed: {e}")
@@ -159,8 +175,9 @@ class PolymarketStreamScraper:
         await self._page.mouse.move(hover_info["x"], hover_info["y"])
         await self._page.wait_for_timeout(100)
         self._last_hover_time = time.time()
-        logger.debug(
-            f"Hovered at {hover_info['xPercent'] * 100:.1f}%: ({hover_info['x']:.0f}, {hover_info['y']:.0f})"
+        logger.log(
+            TRACE,
+            f"Hovered at {hover_info['xPercent'] * 100:.1f}%: ({hover_info['x']:.0f}, {hover_info['y']:.0f})",
         )
 
     async def _navigate_to_current_market(self):
@@ -327,9 +344,6 @@ class PolymarketStreamScraper:
             self._consecutive_no_data = 0
             self._stall_recovery_attempts = 0
             self._last_data_time = current_time
-            self._consecutive_no_data = 0
-            self._stall_recovery_attempts = 0
-            self._last_data_time = current_time
 
     async def _maybe_rehover(self):
         """Re-hover every 0.5 seconds, oscillating x position by 0.01%."""
@@ -340,7 +354,7 @@ class PolymarketStreamScraper:
             else:
                 self._hover_x_percent = 0.8851
 
-            logger.debug(f"Re-hovering at {self._hover_x_percent * 100:.2f}%")
+            logger.log(TRACE, f"Re-hovering at {self._hover_x_percent * 100:.2f}%")
             await self._hover_to_trigger_tooltip()
 
     async def monitor(self, duration: int = None):
@@ -363,10 +377,29 @@ class PolymarketStreamScraper:
                     data = await self._page.evaluate("() => window.currentData")
 
                     if data and data.get("currentPrice") and data.get("priceToBeat"):
-                        local_ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                        price_str = data.get("currentPrice", "")
+                        ptb_str = data.get("priceToBeat", "")
+
+                        # Parse price strings like "$63,188.58" to float
+                        try:
+                            price = float(price_str.replace("$", "").replace(",", ""))
+                        except (ValueError, AttributeError):
+                            price = None
+                        try:
+                            price_to_beat = float(
+                                ptb_str.replace("$", "").replace(",", "")
+                            )
+                        except (ValueError, AttributeError):
+                            price_to_beat = None
+
                         chart_ts = data.get("timestamp", "")
-                        print(
-                            f"[{local_ts}] [chart:{chart_ts}] price: {data['currentPrice']} | price_to_beat: {data['priceToBeat']}"
+
+                        # Notify callbacks
+                        if price is not None:
+                            self._notify_callbacks(price, price_to_beat, chart_ts)
+
+                        logger.debug(
+                            f"[chart:{chart_ts}] price: {price} | price_to_beat: {price_to_beat}"
                         )
 
                     await self._page.evaluate("() => { window.priceChanged = false; }")

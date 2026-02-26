@@ -1,21 +1,34 @@
 import asyncio
 import logging
+import time
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-from playwright.async_api import (
-    async_playwright,
-    TimeoutError as PlaywrightTimeoutError,
-)
+from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 
 
 class ChainlinkStreamScraper:
-    def __init__(self, network: str = "ethereum"):
-        self.network = network
+    def __init__(self, check_interval_ms: int = 1000):
         self._browser = None
         self._page = None
         self._playwright = None
+        self._check_interval_ms = check_interval_ms
+        self._callbacks = []
+        self._running = False
+
+    def add_callback(self, callback):
+        """Add a callback for price updates."""
+        self._callbacks.append(callback)
+
+    def _notify_callbacks(self, mid: float, bid: float, ask: float, timestamp: str):
+        """Notify all callbacks with new price data."""
+        for callback in self._callbacks:
+            try:
+                callback(mid, bid, ask, timestamp)
+            except Exception as e:
+                logger.debug(f"Chainlink callback error: {e}")
 
     async def _init_browser(self):
         if self._playwright is None:
@@ -42,16 +55,16 @@ class ChainlinkStreamScraper:
                 await self._page.wait_for_timeout(200)
 
             # Extract tooltip data
-            tooltip_data = await self._page.evaluate("""() => {
+            tooltip_data = await self._page.evaluate(r"""() => {
                 const tooltip = document.querySelector('.recharts-tooltip-wrapper');
                 if (!tooltip || tooltip.style.visibility !== 'visible') return null;
                 
                 const html = tooltip.innerHTML;
                 
                 // Extract prices - look for "Label: </span><span>$PRICE"
-                const bidMatch = html.match(/Bid:?\s*<\\/span><span[^>]*>\\$?([0-9,]+\\.?\\d*)/);
-                const midMatch = html.match(/Mid-price:?\s*<\\/span><span[^>]*>\\$?([0-9,]+\\.?\\d*)/);
-                const askMatch = html.match(/Ask:?\s*<\\/span><span[^>]*>\\$?([0-9,]+\\.?\\d*)/);
+                const bidMatch = html.match(/Bid:?\s*<\/span><span[^>]*>\$?([0-9,]+\.?\d*)/);
+                const midMatch = html.match(/Mid-price:?\s*<\/span><span[^>]*>\$?([0-9,]+\.?\d*)/);
+                const askMatch = html.match(/Ask:?\s*<\/span><span[^>]*>\$?([0-9,]+\.?\d*)/);
                 
                 // Extract time from the title and convert to 24-hour format
                 const timeMatch = html.match(/>(\d{1,2}:\d{2}:\d{2}\s*(?:AM|PM))/i);
@@ -80,7 +93,7 @@ class ChainlinkStreamScraper:
             return None
 
     async def _setup_mutation_observer(self):
-        await self._page.evaluate("""
+        await self._page.evaluate(r"""
             () => {
                 window.priceChanged = false;
                 window.lastMid = '';
@@ -99,7 +112,7 @@ class ChainlinkStreamScraper:
                     const idx = text.indexOf(label);
                     if (idx >= 0) {
                         const after = text.substring(idx, idx + 40);
-                        const match = after.match(/\\$?([0-9,]+\\.?[0-9]*)/);
+                        const match = after.match(/\$?([0-9,]+\.?\d*)/);
                         return match ? '$' + match[1] : null;
                     }
                     return null;
@@ -135,26 +148,22 @@ class ChainlinkStreamScraper:
         """)
 
     async def monitor(self, duration: int = None):
+        self._running = True
         await self._init_browser()
 
         url = "https://data.chain.link/streams/btc-usd-cexprice-streams"
         await self._page.goto(url, wait_until="networkidle", timeout=60000)
         await self._page.wait_for_timeout(3000)
 
-        # Initial hover to position mouse at right edge
         await self._hover_chart_and_get_tooltip()
-
         await self._setup_mutation_observer()
 
-        start_time = asyncio.get_event_loop().time()
-        last_tooltip_data = None
+        logger.info("Chainlink stream scraper started")
 
-        logger.info(
-            f"Monitoring BTC/USD CEX Price Stream on Chainlink... (Ctrl+C to stop)"
-        )
+        start_time = asyncio.get_event_loop().time()
 
         try:
-            while True:
+            while self._running:
                 changed = await self._page.evaluate("() => window.priceChanged")
 
                 if changed:
@@ -162,19 +171,52 @@ class ChainlinkStreamScraper:
                     bid = await self._page.evaluate("() => window.lastBid")
                     ask = await self._page.evaluate("() => window.lastAsk")
 
-                    # Get tooltip data (hover and extract)
                     tooltip = await self._hover_chart_and_get_tooltip()
 
-                    local_ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    chart_timestamp = ""
+                    mid_price = None
+                    bid_price = None
+                    ask_price = None
 
                     if tooltip and tooltip.get("mid"):
-                        chart_time = tooltip.get("time", "N/A")
-                        print(
-                            f"[{local_ts}] [chart:{chart_time}] BTC/USD → Mid: {tooltip['mid']} | Bid: {tooltip['bid']} | Ask: {tooltip['ask']}"
-                        )
+                        chart_timestamp = tooltip.get("time", "")
+
+                        def parse_price(price_str):
+                            if not price_str:
+                                return None
+                            try:
+                                return float(
+                                    price_str.replace("$", "").replace(",", "")
+                                )
+                            except (ValueError, AttributeError):
+                                return None
+
+                        mid_price = parse_price(tooltip.get("mid", ""))
+                        bid_price = parse_price(tooltip.get("bid", ""))
+                        ask_price = parse_price(tooltip.get("ask", ""))
                     else:
-                        print(
-                            f"[{local_ts}] [chart:N/A] BTC/USD → Mid: {mid} | Bid: {bid} | Ask: {ask}"
+
+                        def parse_price(price_str):
+                            if not price_str:
+                                return None
+                            try:
+                                return float(
+                                    price_str.replace("$", "").replace(",", "")
+                                )
+                            except (ValueError, AttributeError):
+                                return None
+
+                        mid_price = parse_price(mid)
+                        bid_price = parse_price(bid)
+                        ask_price = parse_price(ask)
+
+                    if mid_price is not None:
+                        self._notify_callbacks(
+                            mid_price, bid_price, ask_price, chart_timestamp
+                        )
+                        logger.log(
+                            5,
+                            f"Chainlink: mid={mid_price}, bid={bid_price}, ask={ask_price}",
                         )
 
                     await self._page.evaluate("() => { window.priceChanged = false; }")
@@ -190,6 +232,7 @@ class ChainlinkStreamScraper:
             await self.close()
 
     async def close(self):
+        self._running = False
         if self._browser:
             await self._browser.close()
         if self._playwright:
