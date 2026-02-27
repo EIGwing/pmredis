@@ -605,6 +605,21 @@ class PolymarketCLOB:
                 )
                 self.ws.close()
 
+    def unsubscribe_all(self):
+        """Unsubscribe from all tokens and clear subscription list."""
+        with self._lock:
+            token_ids = list(self._subscribed_tokens)
+            self._subscribed_tokens.clear()
+
+            # Clean up all orderbook data
+            self._orderbooks.clear()
+
+            logger.info(f"CLOB unsubscribe_all: clearing {len(token_ids)} tokens")
+
+            if token_ids and self._running and self.ws:
+                logger.info(f"CLOB clearing all subscriptions, reconnecting...")
+                self.ws.close()
+
     def _run(self):
         """Run the WebSocket connection with auto-reconnect."""
         while self._running:

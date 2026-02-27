@@ -2,7 +2,6 @@ import asyncio
 import logging
 import time
 import threading
-from datetime import datetime
 from typing import Optional
 
 from playwright.async_api import async_playwright
@@ -44,47 +43,47 @@ SELECTORS = {
 
 
 class PolymarketStreamScraper:
-    def __init__(self, check_interval_ms: int = 250):
+    def __init__(self, check_interval_ms: int = 250, stale_threshold: int = 30):
         self._browser = None
-        self._page = None  # Main page for tooltip (current_price, chart_timestamp)
-        self._ptb_page = None  # Temp page for price_to_beat on session switch
         self._playwright = None
-        self._current_epoch = None
-        self._current_price_to_beat: Optional[float] = (
-            None  # Latest price_to_beat (official)
-        )
-        self._fallback_price_to_beat: Optional[float] = (
-            None  # Fallback using last current_price during transition
-        )
-        self._fallback_price_time: float = 0  # Timestamp when fallback was captured
-        self._waiting_for_ptb = (
-            False  # True when transitioning, waiting for official price_to_beat
-        )
-        self._last_current_price: Optional[float] = (
-            None  # Last current_price for fallback
-        )
-        self._last_current_price_time: float = 0  # Timestamp of last current_price
-        self._last_hover_time = 0
-        self._hover_x_percent = 0.885
-        self._last_data_time = 0
-        self._stall_recovery_attempts = 0
-        self._consecutive_no_data = 0
+        self._context = None
+
+        self._tooltip_page = None  # Page 1: current_price + chart_time (continuous)
+        self._ptb_page = None  # Page 2: price_to_beat (session-based)
+        self._tooltip_page_url: str = ""  # Current URL of tooltip page
+
+        self._current_epoch: int = 0
+
+        self._price_to_beat: Optional[float] = None  # Official price_to_beat
+        self._waiting_for_ptb: bool = False  # True when waiting for official PTB
+        self._waiting_for_ptb_start: float = 0  # Start time of waiting for PTB
+        self._ptb_pending_epoch: int = 0  # Epoch we're waiting for PTB
+
+        self._last_current_price: Optional[float] = None
+        self._last_chart_timestamp: str = ""
+
+        self._last_data_change_time: float = 0  # Last time price/chart changed
+        self._last_hover_time: float = 0
+        self._hover_x_percent: float = 0.885
+
         self._check_interval_ms = check_interval_ms
+        self._stale_threshold = stale_threshold
+
         self._callbacks = []
-        self._is_recovering = False  # Flag to prevent duplicate recovery
-        self._reload_event = (
-            threading.Event()
-        )  # Event to signal reload from main thread
+        self._is_recovering = False
+        self._reload_event = threading.Event()
+
+        self._page_load_time: float = 0  # Time when tooltip page was last loaded
 
     def add_callback(self, callback):
-        """Add a callback for price updates."""
         self._callbacks.append(callback)
 
-    def _notify_callbacks(self, price, price_to_beat, timestamp):
-        """Notify all callbacks with new price data."""
+    def _notify_callbacks(
+        self, price: float, price_to_beat: Optional[float], timestamp: str
+    ):
         for callback in self._callbacks:
             try:
-                callback(price, price_to_beat, timestamp)
+                callback(price, price_to_beat, timestamp, self._tooltip_page_url)
             except Exception as e:
                 logger.debug(f"Callback error: {e}")
 
@@ -121,321 +120,129 @@ class PolymarketStreamScraper:
                     "--disk-cache-size=0",
                 ],
             )
-            self._page = await self._browser.new_page(
+            self._context = await self._browser.new_context(
                 viewport={"width": 1280, "height": 720},
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             )
-            self._page.set_default_timeout(30000)
+            logger.info("Browser launched with context")
 
-    def _try_selectors(self, selectors: list) -> str:
-        """Try multiple selectors and return the first one that works."""
-        return None
+    async def _create_tooltip_page(self):
+        """Create or recreate the tooltip page for current_price + chart_time."""
+        logger.info("Creating tooltip page...")
+        if self._tooltip_page:
+            await self._tooltip_page.close()
 
-    async def _validate_tooltip_data(self) -> bool:
-        """Check if tooltip data is actually present after hover."""
-        try:
-            data = await self._page.evaluate("""() => {
-                const selectors = window.__selector_list || [];
-                for (const sel of selectors) {
+        self._tooltip_page = await self._context.new_page()
+        self._tooltip_page.set_default_timeout(30000)
+        self._page_load_time = time.time()
+
+    async def _create_ptb_page(self):
+        """Create or recreate the PTB page for price_to_beat."""
+        logger.info("Creating PTB page...")
+        if self._ptb_page:
+            await self._ptb_page.close()
+
+        self._ptb_page = await self._context.new_page()
+        self._ptb_page.set_default_timeout(30000)
+
+    async def _navigate_tooltip_page(self):
+        """Navigate tooltip page to current market and setup monitoring."""
+        current_epoch = get_current_epoch()
+        url = get_url(current_epoch)
+
+        logger.info(f"Tooltip page: navigating to {url}")
+
+        self._current_epoch = current_epoch
+        self._tooltip_page_url = url
+        await self._tooltip_page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await self._tooltip_page.wait_for_timeout(4000)
+
+        self._page_load_time = time.time()
+
+        await self._setup_tooltip_monitoring()
+        await self._hover_to_trigger_tooltip()
+        await self._tooltip_page.wait_for_timeout(500)
+        await self._hover_to_trigger_tooltip()
+
+    async def _setup_tooltip_monitoring(self):
+        """Setup polling to detect current_price and chart_timestamp changes."""
+        await self._tooltip_page.evaluate(f"""() => {{
+            window.tooltipData = {{ price: null, timestamp: null, changed: false }};
+            window.__tooltip_selectors = {SELECTORS["current_price"] + SELECTORS["timestamp"]};
+
+            const selectors = {{
+                currentPrice: {SELECTORS["current_price"]},
+                timestamp: {SELECTORS["timestamp"]}
+            }};
+
+            const getElementText = (selectors) => {{
+                for (const sel of selectors) {{
                     const el = document.querySelector(sel);
-                    if (el && el.innerText.trim()) {
-                        return true;
-                    }
-                }
-                return false;
-            }""")
-            return data
-        except:
-            return False
+                    if (el) return el.innerText.trim();
+                }}
+                return null;
+            }};
 
-    async def _hover_at_position(self, x: float, y: float, label: str) -> bool:
-        """Hover at a specific position and return success status."""
-        try:
-            await self._page.mouse.move(x, y)
-            await self._page.wait_for_timeout(500)
-            self._last_hover_time = time.time()
-            logger.log(TRACE, f"Hovered at {label}: ({x}, {y})")
-            return True
-        except Exception as e:
-            logger.warning(f"Hover at {label} failed: {e}")
-            return False
+            const checkTooltip = () => {{
+                const price = getElementText(selectors.currentPrice);
+                const ts = getElementText(selectors.timestamp);
+
+                if (price !== null && price !== window.tooltipData.price) {{
+                    window.tooltipData.price = price;
+                    window.tooltipData.changed = true;
+                }}
+                if (ts !== null && ts !== window.tooltipData.timestamp) {{
+                    window.tooltipData.timestamp = ts;
+                    window.tooltipData.changed = true;
+                }}
+            }};
+
+            setInterval(checkTooltip, {self._check_interval_ms});
+        }}""")
 
     async def _hover_to_trigger_tooltip(self):
-        """Hover at oscillating x positions (88.4% ↔ 88.6%) to trigger tooltip."""
-        hover_info = await self._page.evaluate(
+        """Hover at oscillating x positions to trigger tooltip."""
+        hover_info = await self._tooltip_page.evaluate(
             f"""(xPercent) => {{
-            const container = document.querySelector('#price-chart-container');
-            if (!container) return null;
-            
-            const canvas = container.querySelector('canvas');
-            let rect;
-            
-            if (canvas) {{
-                rect = canvas.getBoundingClientRect();
-            }} else {{
-                rect = container.getBoundingClientRect();
-            }}
-            
-            if (rect) {{
-                return {{
-                    x: rect.left + rect.width * xPercent,
-                    y: rect.top + rect.height * 0.2,
-                    xPercent: xPercent
-                }};
-            }}
-            
-            return null;
-        }}""",
+                const container = document.querySelector('#price-chart-container');
+                if (!container) return null;
+                
+                const canvas = container.querySelector('canvas');
+                let rect;
+                
+                if (canvas) {{
+                    rect = canvas.getBoundingClientRect();
+                }} else {{
+                    rect = container.getBoundingClientRect();
+                }}
+                
+                if (rect) {{
+                    return {{
+                        x: rect.left + rect.width * xPercent,
+                        y: rect.top + rect.height * 0.2,
+                        xPercent: xPercent
+                    }};
+                }}
+                
+                return null;
+            }}""",
             self._hover_x_percent,
         )
 
         if not hover_info:
-            logger.warning("Could not determine hover position - container not found")
+            logger.warning("Could not determine hover position")
             return
 
-        await self._page.mouse.move(hover_info["x"], hover_info["y"])
-        await self._page.wait_for_timeout(100)
+        await self._tooltip_page.mouse.move(hover_info["x"], hover_info["y"])
+        await self._tooltip_page.wait_for_timeout(100)
         self._last_hover_time = time.time()
         logger.log(
             TRACE,
             f"Hovered at {hover_info['xPercent'] * 100:.1f}%: ({hover_info['x']:.0f}, {hover_info['y']:.0f})",
         )
 
-    async def _navigate_to_current_market(self):
-        self._current_epoch = get_current_epoch()
-        url = get_url(self._current_epoch)
-        logger.info(f"Navigating to: {url}")
-        self._last_data_time = time.time()  # Start timer BEFORE navigation
-        await self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await self._page.wait_for_timeout(4000)
-
-        # Reset stall detection counters
-        self._consecutive_no_data = 0
-        self._stall_recovery_attempts = 0
-
-        # Setup observer FIRST, then hover
-        await self._setup_mutation_observer()
-        await self._hover_to_trigger_tooltip()
-        # Additional hover after a short delay to ensure tooltip appears
-        await self._page.wait_for_timeout(500)
-        await self._hover_to_trigger_tooltip()
-
-    async def _setup_mutation_observer(self):
-        """Setup MutationObserver to detect price changes with robust selector handling."""
-        # Flatten selectors for JS
-        all_selectors = []
-        for key in ["price_to_beat", "current_price", "timestamp"]:
-            all_selectors.extend(SELECTORS.get(key, []))
-
-        await self._page.evaluate(f"""() => {{
-            window.priceChanged = false;
-            window.lastPriceToBeat = '';
-            window.lastCurrentPrice = '';
-            window.lastTimestamp = '';
-            window.currentData = null;
-            window.__selector_list = {all_selectors};
-
-            // Try each selector set until we find one that works
-            const selectorSets = {{
-                priceToBeat: {SELECTORS["price_to_beat"]},
-                currentPrice: {SELECTORS["current_price"]},
-                timestamp: {SELECTORS["timestamp"]}
-            }};
-
-            const getActiveSelectors = () => {{
-                const result = {{}};
-                for (const [key, selectors] of Object.entries(selectorSets)) {{
-                    for (const sel of selectors) {{
-                        const el = document.querySelector(sel);
-                        if (el) {{
-                            result[key] = sel;
-                            break;
-                        }}
-                    }}
-                }}
-                return result;
-            }};
-
-            const extractData = () => {{
-                const result = {{}};
-                const activeSelectors = getActiveSelectors();
-                
-                if (activeSelectors.priceToBeat) {{
-                    const ptbEl = document.querySelector(activeSelectors.priceToBeat);
-                    if (ptbEl) {{
-                        result.priceToBeat = ptbEl.innerText.trim();
-                    }}
-                }}
-                
-                if (activeSelectors.currentPrice) {{
-                    const priceEl = document.querySelector(activeSelectors.currentPrice);
-                    if (priceEl) {{
-                        result.currentPrice = priceEl.innerText.trim();
-                    }}
-                }}
-                
-                if (activeSelectors.timestamp) {{
-                    const timeEl = document.querySelector(activeSelectors.timestamp);
-                    if (timeEl) {{
-                        result.timestamp = timeEl.innerText.trim();
-                    }}
-                }}
-                
-                // Debug: log if selectors are missing
-                if (!result.priceToBeat || !result.currentPrice || !result.timestamp) {{
-                    console.log('[PM Stream] Missing data - ptb:', !!result.priceToBeat, 'price:', !!result.currentPrice, 'time:', !!result.timestamp);
-                }}
-                
-                return result;
-            }};
-
-            const checkChanges = () => {{
-                const data = extractData();
-                
-                if (data.currentPrice !== undefined && data.currentPrice !== null && 
-                    data.priceToBeat !== undefined && data.priceToBeat !== null && 
-                    data.timestamp !== undefined && data.timestamp !== null) {{
-                    if (data.priceToBeat !== window.lastPriceToBeat || 
-                        data.currentPrice !== window.lastCurrentPrice || 
-                        data.timestamp !== window.lastTimestamp) {{
-                        window.lastPriceToBeat = data.priceToBeat;
-                        window.lastCurrentPrice = data.currentPrice;
-                        window.lastTimestamp = data.timestamp;
-                        window.priceChanged = true;
-                        window.currentData = data;
-                        console.log('[PM Stream] Data updated:', data.currentPrice, data.priceToBeat, data.timestamp);
-                    }}
-                }}
-            }};
-
-            // Initial check
-            setTimeout(checkChanges, 1000);
-
-            // Check at configured interval
-            setInterval(checkChanges, {self._check_interval_ms});
-        }}""")
-
-    async def _get_price_to_beat_from_page(self, page, epoch: int) -> Optional[float]:
-        """Get price_to_beat from a specific page (static DOM, no hover needed)."""
-        url = get_url(epoch)
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(3000)
-
-            # Try multiple selectors for price_to_beat
-            for selector in SELECTORS["price_to_beat"]:
-                try:
-                    ptb_elem = await page.query_selector(selector)
-                    if ptb_elem:
-                        ptb_text = await ptb_elem.inner_text()
-                        if ptb_text:
-                            ptb_value = float(
-                                ptb_text.replace("$", "").replace(",", "")
-                            )
-                            logger.info(
-                                f"Got price_to_beat from epoch {epoch}: {ptb_value}"
-                            )
-                            return ptb_value
-                except Exception:
-                    continue
-
-            logger.warning(f"Could not find price_to_beat selector for epoch {epoch}")
-            return None
-        except Exception as e:
-            logger.error(f"Error getting price_to_beat: {e}")
-            return None
-
-    async def _check_market_transition(self):
-        """Check if we need to get new price_to_beat for new market.
-
-        Uses temp page to get price_to_beat without disrupting main tooltip page.
-        """
-        current_epoch = get_current_epoch()
-        if current_epoch != self._current_epoch:
-            logger.info(f"Market transition: {self._current_epoch} -> {current_epoch}")
-
-            # Set fallback price_to_beat using last current_price (until official one is retrieved)
-            # Only use if we have recent data (within last 10 seconds)
-            if (
-                self._last_current_price is not None
-                and time.time() - self._last_current_price_time < 10
-            ):
-                self._fallback_price_to_beat = self._last_current_price
-                self._fallback_price_time = self._last_current_price_time
-                self._waiting_for_ptb = True
-                logger.info(
-                    f"Using fallback price_to_beat: {self._fallback_price_to_beat} (captured at {self._fallback_price_time})"
-                )
-            else:
-                logger.warning(
-                    f"No recent price data for fallback (last update: {self._last_current_price_time})"
-                )
-
-            # Use temp page to get new price_to_beat
-            if self._ptb_page is None:
-                self._ptb_page = await self._browser.new_page(
-                    viewport={"width": 1280, "height": 720},
-                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                )
-
-            # Get price_to_beat from new session
-            new_ptb = await self._get_price_to_beat_from_page(
-                self._ptb_page, current_epoch
-            )
-            if new_ptb is not None:
-                self._current_price_to_beat = new_ptb
-                self._current_epoch = current_epoch
-                self._waiting_for_ptb = False  # Official price_to_beat received
-                logger.info(
-                    f"Updated price_to_beat to {new_ptb} for epoch {current_epoch}"
-                )
-
-            return True
-        return False
-
-    async def _check_stall_and_recover(self):
-        """Check if stream has stalled and attempt recovery."""
-        current_time = time.time()
-
-        # Skip stall detection for first 10 seconds after page load
-        time_since_load = current_time - self._last_data_time
-        if time_since_load < 10:
-            return
-
-        # Check if we have recent data
-        has_data = await self._page.evaluate("""() => {
-            return window.lastCurrentPrice && window.lastPriceToBeat;
-        }""")
-
-        if not has_data:
-            self._consecutive_no_data += 1
-
-            if self._consecutive_no_data >= 30:  # ~15 seconds of no data
-                self._stall_recovery_attempts += 1
-
-                # Try re-hovering first
-                await self._hover_to_trigger_tooltip()
-
-                # If still no data after multiple attempts, re-navigate
-                if self._stall_recovery_attempts >= 3:
-                    try:
-                        await self._navigate_to_current_market()
-                    except Exception as e:
-                        pass
-
-                    self._stall_recovery_attempts = 0
-
-                self._consecutive_no_data = 0
-        else:
-            # Reset counters when we have data
-            if self._consecutive_no_data > 0:
-                logger.debug("Data stream resumed")
-            self._consecutive_no_data = 0
-            self._stall_recovery_attempts = 0
-            self._last_data_time = current_time
-
     async def _maybe_rehover(self):
-        """Re-hover every 0.5 seconds, oscillating x position by 0.01%."""
+        """Re-hover every 0.5 seconds."""
         elapsed = time.time() - self._last_hover_time
         if elapsed > 0.5:
             if self._hover_x_percent > 0.885:
@@ -446,14 +253,203 @@ class PolymarketStreamScraper:
             logger.log(TRACE, f"Re-hovering at {self._hover_x_percent * 100:.2f}%")
             await self._hover_to_trigger_tooltip()
 
+    async def _navigate_ptb_page(self, epoch: int):
+        """Navigate PTB page to specific epoch and wait for price_to_beat."""
+        url = get_url(epoch)
+        logger.info(f"PTB page: navigating to {url}")
+
+        await self._ptb_page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+        # Wait for price_to_beat to appear (can take several seconds)
+        max_wait = 15
+        start_wait = time.time()
+
+        while time.time() - start_wait < max_wait:
+            ptb_value = await self._extract_ptb_from_page()
+            # PTB must be > 0 to be valid (initial load shows 0)
+            if ptb_value is not None and ptb_value > 0:
+                self._price_to_beat = ptb_value
+                self._waiting_for_ptb = False
+                logger.info(f"Got price_to_beat for epoch {epoch}: {ptb_value}")
+                return True
+
+            await self._ptb_page.wait_for_timeout(1000)
+
+        logger.warning(f"Timeout waiting for price_to_beat for epoch {epoch}")
+        return False
+
+    async def _extract_ptb_from_page(self) -> Optional[float]:
+        """Extract price_to_beat from PTB page."""
+        for selector in SELECTORS["price_to_beat"]:
+            try:
+                elem = await self._ptb_page.query_selector(selector)
+                if elem:
+                    text = await elem.inner_text()
+                    if text:
+                        value = float(text.replace("$", "").replace(",", ""))
+                        return value
+            except Exception:
+                continue
+        return None
+
+    async def _check_market_transition(self):
+        """Check if session changed and handle PTB page transition (non-blocking)."""
+        current_epoch = get_current_epoch()
+
+        if current_epoch != self._current_epoch:
+            logger.info(f"Session transition: {self._current_epoch} -> {current_epoch}")
+
+            # Set fallback PTB using last current_price
+            if self._last_current_price is not None:
+                logger.info(f"Using fallback PTB: {self._last_current_price}")
+
+            self._waiting_for_ptb = True
+            self._waiting_for_ptb_start = time.time()
+            self._ptb_pending_epoch = current_epoch
+
+            # Start PTB page navigation in background (non-blocking within same event loop)
+            asyncio.create_task(self._navigate_ptb_page_async(current_epoch))
+
+            self._current_epoch = current_epoch
+            return True
+
+        # Check if PTB is ready (non-blocking)
+        await self._check_ptb_ready()
+
+        return False
+
+    async def _navigate_ptb_page_async(self, epoch: int):
+        """Navigate PTB page asynchronously (runs in background of main event loop)."""
+        url = get_url(epoch)
+        logger.info(f"PTB async: navigating to {url}")
+
+        try:
+            # Start navigation but don't wait for it to complete
+            nav_task = asyncio.create_task(
+                self._ptb_page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            )
+
+            # Wait for navigation to complete
+            await nav_task
+
+            # Now poll for PTB
+            max_wait = 15
+            start_wait = time.time()
+
+            while time.time() - start_wait < max_wait:
+                ptb_value = await self._extract_ptb_from_page()
+                # PTB must be > 0 to be valid
+                if ptb_value is not None and ptb_value > 0:
+                    self._price_to_beat = ptb_value
+                    self._waiting_for_ptb = False
+                    logger.info(
+                        f"PTB async: got price_to_beat for epoch {epoch}: {ptb_value}"
+                    )
+                    return True
+
+                await self._ptb_page.wait_for_timeout(1000)
+
+            logger.warning(
+                f"PTB async: timeout waiting for price_to_beat for epoch {epoch}"
+            )
+        except Exception as e:
+            logger.error(f"PTB async: error: {e}")
+
+        self._waiting_for_ptb = False
+        return False
+
+        try:
+            await self._ptb_page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+            max_wait = 15
+            start_wait = time.time()
+
+            while time.time() - start_wait < max_wait:
+                ptb_value = await self._extract_ptb_from_page()
+                # PTB must be > 0 to be valid
+                if ptb_value is not None and ptb_value > 0:
+                    self._price_to_beat = ptb_value
+                    self._waiting_for_ptb = False
+                    logger.info(
+                        f"PTB background: got price_to_beat for epoch {epoch}: {ptb_value}"
+                    )
+                    return True
+
+                await self._ptb_page.wait_for_timeout(1000)
+
+            logger.warning(
+                f"PTB background: timeout waiting for price_to_beat for epoch {epoch}"
+            )
+        except Exception as e:
+            logger.error(f"PTB background: error: {e}")
+
+        self._waiting_for_ptb = False
+        return False
+
+    async def _check_ptb_ready(self):
+        """Non-blocking check if PTB is available."""
+        if self._waiting_for_ptb and self._ptb_pending_epoch == self._current_epoch:
+            ptb_value = await self._extract_ptb_from_page()
+            if ptb_value is not None and ptb_value > 0:
+                self._price_to_beat = ptb_value
+                self._waiting_for_ptb = False
+                logger.info(f"PTB ready: {ptb_value}")
+
+    async def _check_stale_and_reload(self):
+        """Check if tooltip data is stale and reload if needed."""
+        # Skip for first 10 seconds after page load
+        if time.time() - self._page_load_time < 10:
+            return
+
+        # Check if we have data
+        if self._last_current_price is None:
+            return
+
+        # Check staleness
+        time_since_change = time.time() - self._last_data_change_time
+        if time_since_change > self._stale_threshold:
+            logger.warning(
+                f"Tooltip data stale ({time_since_change:.1f}s), reloading page"
+            )
+            await self._reload_tooltip_page()
+
+    async def _reload_tooltip_page(self):
+        """Reload the tooltip page to current market."""
+        if self._is_recovering:
+            logger.debug("Reload already in progress")
+            return
+
+        self._is_recovering = True
+        try:
+            await self._navigate_tooltip_page()
+            logger.info("Tooltip page reloaded")
+        finally:
+            self._is_recovering = False
+
+    async def _extract_tooltip_data(self) -> tuple:
+        """Extract current_price and chart_timestamp from tooltip page."""
+        try:
+            data = await self._tooltip_page.evaluate("() => window.tooltipData")
+            if data and data.get("changed"):
+                await self._tooltip_page.evaluate(
+                    "() => window.tooltipData.changed = false"
+                )
+                return data.get("price"), data.get("timestamp")
+        except Exception as e:
+            logger.debug(f"Error extracting tooltip data: {e}")
+        return None, None
+
     async def monitor(self, duration: int = None):
         await self._init_browser()
-        await self._navigate_to_current_market()
 
-        # Get initial price_to_beat from current session
-        self._current_price_to_beat = await self._get_price_to_beat_from_page(
-            self._page, self._current_epoch
-        )
+        # Create both pages
+        await self._create_tooltip_page()
+        await asyncio.sleep(1)
+        await self._create_ptb_page()
+
+        # Initial navigation
+        await self._navigate_tooltip_page()
+        await self._navigate_ptb_page(get_current_epoch())
 
         start_time = asyncio.get_event_loop().time()
 
@@ -461,52 +457,50 @@ class PolymarketStreamScraper:
 
         try:
             while True:
-                # Check if reload is requested from main thread
+                # Check for external reload request
                 if self._reload_event.is_set():
                     self._reload_event.clear()
-                    await self.reload()
+                    await self._reload_tooltip_page()
 
+                # Check session transition
                 await self._check_market_transition()
+
+                # Re-hover to keep tooltip active
                 await self._maybe_rehover()
-                await self._check_stall_and_recover()
 
-                changed = await self._page.evaluate("() => window.priceChanged")
+                # Check staleness
+                await self._check_stale_and_reload()
 
-                if changed:
-                    data = await self._page.evaluate("() => window.currentData")
+                # Extract data from tooltip page
+                price_str, chart_ts = await self._extract_tooltip_data()
 
-                    if data and data.get("currentPrice"):
-                        price_str = data.get("currentPrice", "")
-                        chart_ts = data.get("timestamp", "")
+                if price_str:
+                    try:
+                        price = float(price_str.replace("$", "").replace(",", ""))
+                    except (ValueError, AttributeError):
+                        price = None
 
-                        # Parse price string like "$63,188.58" to float
-                        try:
-                            price = float(price_str.replace("$", "").replace(",", ""))
-                        except (ValueError, AttributeError):
-                            price = None
+                    if price is not None:
+                        # Update last values
+                        self._last_current_price = price
+                        self._last_chart_timestamp = chart_ts or ""
+                        self._last_data_change_time = time.time()
 
-                        # Save last current_price for fallback during transition
-                        if price is not None:
-                            self._last_current_price = price
-                            self._last_current_price_time = time.time()
-                            # Use fallback if waiting for official price_to_beat
-                            if (
-                                self._waiting_for_ptb
-                                and self._fallback_price_to_beat is not None
-                            ):
-                                price_to_beat = self._fallback_price_to_beat
-                            else:
-                                price_to_beat = self._current_price_to_beat
+                        # Determine price_to_beat
+                        if self._waiting_for_ptb and self._price_to_beat is None:
+                            # Still waiting for official PTB, use fallback
+                            ptb = self._last_current_price
+                            wait_time = time.time() - self._waiting_for_ptb_start
+                            logger.debug(
+                                f"[waiting_for_ptb] {wait_time:.1f}s elapsed, using fallback PTB: {ptb}"
+                            )
+                        else:
+                            ptb = self._price_to_beat
 
-                        # Notify callbacks with price from tooltip and price_to_beat from transition
-                        if price is not None:
-                            self._notify_callbacks(price, price_to_beat, chart_ts)
+                        # Notify callbacks
+                        self._notify_callbacks(price, ptb, chart_ts or "")
 
-                        logger.debug(
-                            f"[chart:{chart_ts}] price: {price} | price_to_beat: {price_to_beat}"
-                        )
-
-                    await self._page.evaluate("() => { window.priceChanged = false; }")
+                        logger.debug(f"[chart:{chart_ts}] price: {price} | ptb: {ptb}")
 
                 if duration:
                     elapsed = asyncio.get_event_loop().time() - start_time
@@ -519,44 +513,27 @@ class PolymarketStreamScraper:
             await self.close()
 
     async def close(self):
+        if self._tooltip_page:
+            await self._tooltip_page.close()
+            self._tooltip_page = None
         if self._ptb_page:
             await self._ptb_page.close()
             self._ptb_page = None
+        if self._context:
+            await self._context.close()
+            self._context = None
         if self._browser:
             await self._browser.close()
         if self._playwright:
             await self._playwright.stop()
 
     def is_recovering(self) -> bool:
-        """Check if recovery is in progress."""
         return self._is_recovering
 
     def trigger_reload(self):
         """Trigger reload from external thread (main.py)."""
         logger.info("External reload requested")
         self._reload_event.set()
-
-    async def reload(self):
-        """Force reload of the main tooltip page (for recovery)."""
-        if self._is_recovering:
-            logger.debug("Recovery already in progress, skipping")
-            return
-
-        self._is_recovering = True
-        logger.info("Triggering recovery: re-navigating tooltip page to current market")
-
-        try:
-            # Re-navigate the main page to current market
-            await self._navigate_to_current_market()
-
-            # Also refresh price_to_beat
-            self._current_price_to_beat = await self._get_price_to_beat_from_page(
-                self._page, self._current_epoch
-            )
-
-            logger.info("Recovery complete")
-        finally:
-            self._is_recovering = False
 
 
 async def run_polymarket_stream(duration: int = None):

@@ -160,6 +160,7 @@ class DataCollectorRedis:
             None  # Last chart timestamp in ms
         )
         self._pm_stream_last_price: Optional[float] = None  # Last price value
+        self._pm_stream_tooltip_url: str = ""  # Current tooltip page URL
         self._pm_stream_no_change_threshold: float = 30.0  # seconds
         self._pm_stream_recovery_in_progress = False
 
@@ -234,7 +235,7 @@ class DataCollectorRedis:
         try:
             from pmredis.collectors.polymarket_stream import PolymarketStreamScraper
 
-            def on_price_update(price, price_to_beat, timestamp):
+            def on_price_update(price, price_to_beat, timestamp, tooltip_url):
                 """Callback for price updates from polymarket_stream."""
                 # Parse chart timestamp to epoch ms for staleness detection
                 chart_ts_utc = 0
@@ -246,13 +247,17 @@ class DataCollectorRedis:
                     self._pm_stream_price = price
                     self._pm_stream_price_to_beat = price_to_beat
                     self._pm_stream_timestamp = timestamp
+                    self._pm_stream_tooltip_url = tooltip_url
                     self._pm_stream_last_update = time.time()
                     # Store for staleness detection
                     if chart_ts_utc:
                         self._pm_stream_last_chart_timestamp = chart_ts_utc
                     if price:
                         self._pm_stream_last_price = price
-                logger.log(TRACE, f"Price update: {price} | ptb: {price_to_beat}")
+                logger.log(
+                    TRACE,
+                    f"Price update: {price} | ptb: {price_to_beat} | url: {tooltip_url}",
+                )
 
             def run_scraper():
                 loop = asyncio.new_event_loop()
@@ -400,7 +405,7 @@ class DataCollectorRedis:
 
         # Start background trimming thread (skip in dry-run mode)
         if not self.dry_run:
-            self._start_trimming_thread(interval_seconds=60, window_seconds=2400)
+            self._start_trimming_thread(interval_seconds=60, window_seconds=2700)
 
         # Initialize collectors based on tables
         self._initialize_collectors()
@@ -455,11 +460,6 @@ class DataCollectorRedis:
                 # Sample data
                 self._sample_data(loop_count)
                 loop_count += 1
-
-                # Trim streams periodically
-                if time.time() - last_flush >= 60:
-                    self._trim_streams()
-                    last_flush = time.time()
 
                 # Export to parquet every minute
                 current_time = time.localtime()
@@ -517,13 +517,13 @@ class DataCollectorRedis:
             )
             self._current_session_epoch = current_epoch
 
-            # Unsubscribe from old current session tokens before switching
+            # FIXED: Instead of clearing all, just rotate subscriptions
+            # 1. Unsubscribe old current (2 tokens that are now expired)
             old_asset_ids = list(self._asset_ids) if self._asset_ids else []
-            if old_asset_ids and self._pm_clob_ws:
+            if self._pm_clob_ws and old_asset_ids:
                 self._pm_clob_ws.unsubscribe(old_asset_ids)
-                logger.info(f"Unsubscribed from old session tokens: {old_asset_ids}")
 
-            # Move next session data to current
+            # 2. Move next session data to current (orderbook data is ALREADY subscribed)
             with self._pm_ws_lock:
                 if self._next_pm_yes_orderbook or self._next_pm_no_orderbook:
                     self._pm_yes_price = getattr(self, "_next_pm_yes_price", None)
@@ -541,10 +541,13 @@ class DataCollectorRedis:
                     self._next_pm_yes_orderbook = {}
                     self._next_pm_no_orderbook = {}
 
-            # Move next asset IDs to current
+            # 3. Move next asset IDs to current (these are ALREADY subscribed!)
             if self._next_asset_ids:
                 self._asset_ids = list(self._next_asset_ids)
                 self._next_asset_ids = []
+
+            # 4. Fetch new next market IMMEDIATELY to subscribe to it
+            self._fetch_polymarket_markets()
 
     def _fetch_polymarket_markets(self):
         """Fetch current and upcoming Polymarket BTC markets."""
@@ -823,6 +826,7 @@ class DataCollectorRedis:
         # Get price from polymarket_stream scraper
         with self._pm_ws_lock:
             rtdws_price = self._pm_stream_price
+            price_to_beat = self._pm_stream_price_to_beat
 
         # Get YES/NO prices from orderbook
         with self._pm_ws_lock:
@@ -831,7 +835,7 @@ class DataCollectorRedis:
             session_price = self._pm_session_price
 
         logger.debug(
-            f"polymarket_prices values - stream: {rtdws_price}, yes: {yes_price}, session: {session_price}"
+            f"polymarket_prices values - stream: {rtdws_price}, ptb: {price_to_beat}, yes: {yes_price}, session: {session_price}"
         )
 
         # Check for stale polymarket_stream data
@@ -864,6 +868,7 @@ class DataCollectorRedis:
                 "yes_price": str(yes_price) if yes_price else "",
                 "no_price": str(no_price_calc) if no_price_calc is not None else "",
                 "btc_price": str(rtdws_price) if rtdws_price else "",
+                "price_to_beat": str(price_to_beat) if price_to_beat else "",
                 "direction": str(direction),
                 "change_from_session": str(change),
             }
@@ -1042,6 +1047,7 @@ class DataCollectorRedis:
             price = self._pm_stream_price
             price_to_beat = self._pm_stream_price_to_beat
             timestamp = self._pm_stream_timestamp
+            tooltip_url = self._pm_stream_tooltip_url
 
         if price is not None:
             chart_ts_utc = 0
@@ -1080,6 +1086,7 @@ class DataCollectorRedis:
                 "price_to_beat": str(price_to_beat) if price_to_beat else "",
                 "chart_timestamp": str(timestamp) if timestamp else "",
                 "chart_timestamp_utc": str(chart_ts_utc) if chart_ts_utc else "0",
+                "tooltip_url": tooltip_url,
             }
             stream_key = get_stream_key("polymarket_stream")
             self.redis.xadd(stream_key, record)
@@ -1246,7 +1253,7 @@ class DataCollectorRedis:
     def _trim_worker(self, interval_seconds: int = 60, window_seconds: int = 2400):
         """Background worker that trims streams older than window_seconds."""
         logger.info(
-            f"Starting trim worker: interval={interval_seconds}s, window={window_seconds}s"
+            f"Starting trim worker: interval={interval_seconds}s, window={window_seconds}s ({window_seconds / 60:.0f} min)"
         )
         while not self._shutdown_event.is_set():
             try:

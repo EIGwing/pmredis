@@ -161,7 +161,7 @@ class RedisManager:
         cutoff_id = f"{int(cutoff_ms)}-0"
 
         try:
-            removed = self._client.xtrim(stream_key, minid=cutoff_id, limit=100)
+            removed = self._client.xtrim(stream_key, minid=cutoff_id)
             return removed
         except redis.RedisError as e:
             logger.error(f"Failed to trim stream {stream_key}: {e}")
