@@ -594,6 +594,19 @@ class DataCollectorRedis:
                 if self._pm_clob_ws and self._next_asset_ids:
                     self._pm_clob_ws.subscribe(self._next_asset_ids)
 
+            # Cleanup: remove stale tokens that are no longer needed
+            if self._pm_clob_ws and (self._asset_ids or self._next_asset_ids):
+                subscribed = self._pm_clob_ws.get_all_orderbooks()
+                subscribed_ids = set(subscribed.keys())
+                needed_ids = set(self._asset_ids) | set(self._next_asset_ids)
+                tokens_to_remove = subscribed_ids - needed_ids
+
+                if tokens_to_remove:
+                    logger.info(
+                        f"CLOB cleaning up {len(tokens_to_remove)} stale tokens: {list(tokens_to_remove)[:3]}..."
+                    )
+                    self._pm_clob_ws.unsubscribe(list(tokens_to_remove))
+
             # Log subscription count
             if self._pm_clob_ws:
                 sub_count = self._pm_clob_ws.get_subscription_count()
